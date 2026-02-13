@@ -3,20 +3,14 @@
 #import <CoreFoundation/CoreFoundation.h>
 
 // =======================================================
-// ⚙️ 用户配置区域
+// ⚙️ 沙盒安全版配置 (针对 iOS 18 证书签名优化)
 // =======================================================
 static NSString *const kFakeBundleID = @"com.xingin.discover"; 
-static const double kAlertDelay = 10.0; 
+static const double kAlertDelay = 8.0; 
 // =======================================================
 
-@interface LSApplicationProxy : NSObject
-+ (id)applicationProxyForIdentifier:(id)arg1;
-@property(readonly, nonatomic) NSString *applicationIdentifier;
-@property(readonly, nonatomic) NSString *bundleIdentifier;
-@end
-
 // ----------------------------------------------------------------
-// 第一部分：Objective-C 层拦截
+// 第一部分：Objective-C 层拦截 (最稳，不闪退)
 // ----------------------------------------------------------------
 %hook NSBundle
 
@@ -50,36 +44,27 @@ static const double kAlertDelay = 10.0;
 %end
 
 // ----------------------------------------------------------------
-// 第二部分：C 语言底层拦截 (已修复 ARC 报错)
+// 第二部分：基础 C 语言拦截 (保留最核心的一个)
 // ----------------------------------------------------------------
 
 %hookf(CFStringRef, CFBundleGetIdentifier, CFBundleRef bundle) {
     if (bundle == CFBundleGetMainBundle()) {
-        // 修复点 1: 添加 (__bridge CFStringRef)
+        // 使用安全转换，防止内存报错
         return (__bridge CFStringRef)kFakeBundleID;
     }
     return %orig(bundle);
 }
 
-%hookf(const void *, CFBundleGetValueForInfoDictionaryKey, CFBundleRef bundle, CFStringRef key) {
-    if (CFStringCompare(key, kCFBundleIdentifierKey, 0) == kCFCompareEqualTo) {
-        if (bundle == CFBundleGetMainBundle()) {
-            // 修复点 2: 添加 (__bridge const void *)
-            return (__bridge const void *)kFakeBundleID;
-        }
-    }
-    return %orig(bundle, key);
-}
-
 
 // ----------------------------------------------------------------
-// 第三部分：文件 I/O 拦截
+// 第三部分：文件读取拦截 (安全版)
 // ----------------------------------------------------------------
 %hook NSDictionary
 
 + (id)dictionaryWithContentsOfFile:(NSString *)path {
     id result = %orig(path);
     if (result && path && [path hasSuffix:@"Info.plist"]) {
+        // 增加更严格的判断，防止误伤其他文件导致闪退
         if ([path rangeOfString:[[NSBundle mainBundle] bundlePath]].location != NSNotFound) {
             NSMutableDictionary *mutableDict = [result mutableCopy];
             mutableDict[@"CFBundleIdentifier"] = kFakeBundleID;
@@ -89,39 +74,11 @@ static const double kAlertDelay = 10.0;
     return result;
 }
 
-+ (id)dictionaryWithContentsOfURL:(NSURL *)url {
-    id result = %orig(url);
-    if (result && url && [[url path] hasSuffix:@"Info.plist"]) {
-        if ([[url path] rangeOfString:[[NSBundle mainBundle] bundlePath]].location != NSNotFound) {
-            NSMutableDictionary *mutableDict = [result mutableCopy];
-            mutableDict[@"CFBundleIdentifier"] = kFakeBundleID;
-            return mutableDict;
-        }
-    }
-    return result;
-}
-
 %end
 
 
 // ----------------------------------------------------------------
-// 第四部分：私有 API 拦截
-// ----------------------------------------------------------------
-%hook LSApplicationProxy
-
-- (NSString *)bundleIdentifier {
-    return kFakeBundleID;
-}
-
-- (NSString *)applicationIdentifier {
-    return kFakeBundleID;
-}
-
-%end
-
-
-// ----------------------------------------------------------------
-// 第五部分：弹窗验证 (已修复 keyWindow 报错)
+// 第四部分：弹窗验证
 // ----------------------------------------------------------------
 %hook UIApplication
 
@@ -134,28 +91,34 @@ static const double kAlertDelay = 10.0;
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAlertDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         
-        // 修复点: 同样使用 bridge 转换
-        NSString *checkID = (__bridge NSString *)CFBundleGetIdentifier(CFBundleGetMainBundle());
+        // 简单获取，防止调用底层 API 导致崩溃
+        NSString *checkID = [[NSBundle mainBundle] bundleIdentifier];
         
-        NSString *msg = [NSString stringWithFormat:@"终极拦截已生效\n\n当前 APP 识别到的 ID:\n%@", checkID];
+        NSString *msg = [NSString stringWithFormat:@"✅ 安全模式启动\n伪装 ID:\n%@", checkID];
         
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"🛡️ BundleID 伪装" 
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"插件已生效" 
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Nice" style:UIAlertActionStyleDefault handler:nil]];
         
-        // 修复点 3: 忽略 keyWindow 过时警告
+        // 安全获取 UIWindow
         UIWindow *win = nil;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        win = [UIApplication sharedApplication].keyWindow;
-#pragma clang diagnostic pop
-        
-        UIViewController *rootVC = win.rootViewController;
-        while (rootVC.presentedViewController) {
-            rootVC = rootVC.presentedViewController;
+        // 尝试获取 keyWindow，失败则遍历
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                 if (scene.activationState == UISceneActivationStateForegroundActive) {
+                     for (UIWindow *w in scene.windows) {
+                         if (w.isKeyWindow) {
+                             win = w;
+                             break;
+                         }
+                     }
+                 }
+            }
         }
-        [rootVC presentViewController:alert animated:YES completion:nil];
+        if (!win) win = [UIApplication sharedApplication].windows.firstObject;
+        
+        [win.rootViewController presentViewController:alert animated:YES completion:nil];
     });
 }
 
