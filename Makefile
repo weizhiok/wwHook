@@ -1,14 +1,15 @@
 TARGET := iphone:clang:latest:14.0
-INSTALL_TARGET_PROCESSES = SpringBoard
+# 移除 SpringBoard 限制，允许注入任何进程
+# INSTALL_TARGET_PROCESSES = SpringBoard
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = FakeBundleID
+# 注意：这里改成了 LIBRARY_NAME，不再是 TWEAK_NAME
+LIBRARY_NAME = FakeBundleID
 
-FakeBundleID_FILES = Tweak.x
+FakeBundleID_FILES = Tweak.m
 FakeBundleID_CFLAGS = -fobjc-arc
+FakeBundleID_FRAMEWORKS = UIKit Foundation
 
-# 只链接这 3 个最基础的公开框架
-FakeBundleID_FRAMEWORKS = UIKit Foundation CoreFoundation
-
-include $(THEOS_MAKE_PATH)/tweak.mk
+# 🟢 关键修改：使用 library.mk (普通库模式)，完全脱离 Substrate 依赖
+include $(THEOS_MAKE_PATH)/library.mk
