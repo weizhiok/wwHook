@@ -6,7 +6,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
       
@@ -17,8 +17,6 @@ jobs:
           
       - name: Get Private Frameworks (Simulated)
         run: |
-          # 因为 GitHub 环境没有私有 SDK，我们需要下载或者忽略检查
-          # 这里使用一种简单粗暴的方法：直接让 Theos 允许编译
           echo "::group::Setup SDK"
           curl -L -o iOS14.0.sdk.tar.xz https://github.com/xybp888/iOS-SDKs/releases/download/iOS14.0.sdk/iOS14.0.sdk.tar.xz
           tar -xf iOS14.0.sdk.tar.xz -C $THEOS/sdks/
@@ -27,11 +25,11 @@ jobs:
 
       - name: Build Tweak
         run: |
-          # 强制使用刚下载的 SDK
           make package FINALPACKAGE=1 TARGET=iphone:clang:latest:14.0
           
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        # ⚠️ 这里是修复的关键：v3 改为了 v4
+        uses: actions/upload-artifact@v4
         with:
           name: FakeBundleID_Dylib
           path: .theos/obj/debug/*.dylib
