@@ -1,4 +1,4 @@
-name: Build Ultimate Hook
+name: Build Standalone Lib
 
 on: [push]
 
@@ -16,24 +16,17 @@ jobs:
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
       
       - name: Install ldid
-        run: |
-          brew install ldid
+        run: brew install ldid
           
-      - name: Build Tweak
+      - name: Build Library
         run: |
-          # 1. 开始编译
+          # 编译
           make package FINALPACKAGE=1
-          
-          # 2. 🟢 关键操作：把藏起来的 dylib 抓出来！
-          # 我们用 find 命令在 .theos 文件夹里查找任何 dylib，并复制到当前目录
-          find .theos -name "*.dylib" -exec cp {} ./FakeBundleID_Final.dylib \;
-          
-          # 3. 打印一下当前目录文件，确保文件在这（方便排错）
-          ls -l
+          # 搜索生成的 dylib (不管是 debug 还是 release，只要是 dylib 都抓出来)
+          find .theos -name "*.dylib" -exec cp {} ./FakeBundleID_Standalone.dylib \;
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FakeBundleID_Plugin
-          # 🟢 关键修改：直接上传我们刚刚复制出来的这个文件，不含任何路径，绝对能找到
-          path: FakeBundleID_Final.dylib
+          name: FakeBundleID_Standalone
+          path: FakeBundleID_Standalone.dylib
