@@ -1,0 +1,9 @@
+Package: com.weizhiok.fakebundleid
+Name: FakeBundleID
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 伪装 BundleID 插件
+Maintainer: weizhiok
+Author: weizhiok
+Section: Tweaks
+Depends: mobilesubstrate
