@@ -1,1 +1,1 @@
-{ Filter = { Bundles = ( "com.www.www", "com.www.www.01", "com.www.www.02", "com.www.www.03" ); }; }
+{ Filter = { Bundles = ( "com.apple.UIKit" ); }; }
