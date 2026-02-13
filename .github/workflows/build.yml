@@ -14,10 +14,15 @@ jobs:
         run: |
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+      
+      - name: Install ldid
+        run: |
+          # 🟢 关键修复：安装签名工具
+          brew install ldid
           
       - name: Build Tweak
         run: |
-          # 直接使用 Theos 自带环境编译
+          # 编译命令
           make package FINALPACKAGE=1
           
       - name: Upload Artifact
