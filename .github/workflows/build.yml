@@ -17,16 +17,15 @@ jobs:
       
       - name: Install ldid
         run: |
-          # 🟢 关键修复：安装签名工具
           brew install ldid
           
       - name: Build Tweak
         run: |
-          # 编译命令
           make package FINALPACKAGE=1
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FakeBundleID_Dylib
-          path: .theos/obj/debug/*.dylib
+          # 🟢 关键修改：使用 ** 通配符，搜索 .theos 下所有文件夹
+          path: .theos/**/*.dylib
