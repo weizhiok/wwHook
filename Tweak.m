@@ -18,7 +18,7 @@ static NSString * const kTargetBundleID = @"com.user.bundlechecker";
 static NSString *gFakePlistPath = nil;
 
 // ----------------------------------------------------------------
-// 🐟 核心引擎：Fishhook (Lazy + Non-Lazy + vm_protect)
+// 🐟 核心引擎：Fishhook (VM_PROTECT 版)
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -40,14 +40,15 @@ struct rebind_entry {
     void **replaced;
 };
 
-// 🛡️ 安全写入 (vm_protect)
+// 🛡️ 安全写入：解锁 -> 写入 -> 上锁
 static void safe_write_pointer(void **target, void *replacement) {
     kern_return_t err;
     vm_address_t page_start = (vm_address_t)target & ~(PAGE_SIZE - 1);
     err = vm_protect(mach_task_self(), page_start, PAGE_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (err != KERN_SUCCESS) return;
     *target = replacement;
-    // 写入后尝试恢复权限(可选)，为了防闪退保持可写通常也没事，只要不是__TEXT段
+    // 写入后立即恢复只读，防止 3 秒闪退
+    vm_protect(mach_task_self(), page_start, PAGE_SIZE, 0, VM_PROT_READ);
 }
 
 static void rebind_data_symbols(const struct mach_header *header, intptr_t slide, struct rebind_entry *rebinds, size_t nrebinds) {
@@ -110,22 +111,28 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
 }
 
 // ----------------------------------------------------------------
-// 🛡️ Hook 函数集
+// 🛡️ 原函数指针
 // ----------------------------------------------------------------
 static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef bundle);
 static FILE *(*orig_fopen)(const char *path, const char *mode);
 static CFStringRef (*orig_SecTaskCopySigningIdentifier)(void *task, CFErrorRef *error);
-// 🟢 新增：dladdr 原函数
+// 🟢 新增
 static int (*orig_dladdr)(const void *, Dl_info *);
+static void* (*orig_dlsym)(void * __handle, const char * __symbol);
 
-// 1. C API Hook (第2项)
+
+// ----------------------------------------------------------------
+// 🕵️‍♂️ Hook 实现函数
+// ----------------------------------------------------------------
+
+// 1. C API (第2项)
 CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
     if (bundle == CFBundleGetMainBundle()) return (__bridge CFStringRef)kTargetBundleID;
     if (orig_CFBundleGetIdentifier) return orig_CFBundleGetIdentifier(bundle);
     return NULL;
 }
 
-// 2. IO Hook (第4项)
+// 2. IO (第4项)
 FILE *new_fopen(const char *path, const char *mode) {
     if (path && strstr(path, "Info.plist") && gFakePlistPath) {
         return orig_fopen([gFakePlistPath UTF8String], mode);
@@ -133,45 +140,73 @@ FILE *new_fopen(const char *path, const char *mode) {
     return orig_fopen(path, mode);
 }
 
-// 3. SecTask Hook (第5项)
+// 3. SecTask (第5项)
 CFStringRef new_SecTaskCopySigningIdentifier(void *task, CFErrorRef *error) {
     return (__bridge CFStringRef)kTargetBundleID;
 }
 
-// 4. 🟢 新增：dladdr Hook (第8项 - 反Swizzle检测)
-// 这是骗过“Runtime Swizzle 检测”的核心！
+// 4. dladdr (第8项的核心逻辑)
+// 这里的逻辑是：如果查到了我们的 hook 函数，就撒谎说是 Foundation 里的
 int new_dladdr(const void *addr, Dl_info *info) {
-    // 先调用原函数获取真实信息
-    int result = orig_dladdr(addr, info);
+    // 必须先调用原函数，填充 info
+    int result = 0;
+    if (orig_dladdr) {
+        result = orig_dladdr(addr, info);
+    } else {
+        // 如果 orig_dladdr 还没拿到（极少见），尝试用 dlsym 找一下
+        // 但这里要小心死循环，简单起见直接返回
+        return 0;
+    }
     
     if (result && info && info->dli_sname) {
-        // 检查：如果这个地址是我们的 Hook 函数 (名字里包含 hook_ 或者 new_)
-        // 或者简单点，如果它属于我们的 dylib (dli_fname 不是系统路径)
         const char *name = info->dli_sname;
         
-        // 如果检测代码查到了我们的 Swizzle 方法
-        if (strstr(name, "hook_bundleIdentifier") || 
-            strstr(name, "hook_infoDictionary") || 
-            strstr(name, "hook_pathForResource")) {
+        // 🚨 检查是否是被检测的 Hook 函数
+        if (strstr(name, "hook_bundleIdentifier") ||
+            strstr(name, "hook_infoDictionary")) {
             
-            NSLog(@"[Stealth] 🕵️‍♂️ 拦截到 Swizzle 检测 (dladdr): %s", name);
+            NSLog(@"[Stealth] 🕵️‍♂️ dladdr 查户口被拦截: %s", name);
             
-            // 欺诈开始：我们需要伪造一个 Foundation 的身份
-            // 获取一个真正的系统函数地址，比如 NSBundle 的类对象
+            // 🎭 伪造身份：获取真正的 NSBundle 信息
             Dl_info fakeInfo;
             if (orig_dladdr((__bridge const void *)[NSBundle class], &fakeInfo)) {
-                // 将我们的函数伪装成 Foundation 里的函数
-                info->dli_fname = fakeInfo.dli_fname; // "/System/Library/Frameworks/Foundation.framework/..."
+                // 将 dli_fname 改为 /System/.../Foundation.framework/...
+                info->dli_fname = fakeInfo.dli_fname;
                 info->dli_fbase = fakeInfo.dli_fbase;
                 
-                // 把名字改回原本的样子 (去掉 hook_ 前缀)
-                if (strstr(name, "hook_bundleIdentifier")) info->dli_sname = "bundleIdentifier";
-                else if (strstr(name, "hook_infoDictionary")) info->dli_sname = "infoDictionary";
-                else if (strstr(name, "hook_pathForResource")) info->dli_sname = "pathForResource:ofType:";
+                // 将 dli_sname 改回 bundleIdentifier
+                // 这样检测代码就会认为它指向的是系统函数，而不是我们的 hook
+                if (strstr(name, "hook_bundleIdentifier")) {
+                    info->dli_sname = "bundleIdentifier";
+                } else if (strstr(name, "hook_infoDictionary")) {
+                    info->dli_sname = "infoDictionary";
+                }
             }
         }
     }
     return result;
+}
+
+// 5. dlsym (第8项的关键入口)
+// 你的检测代码用 dlsym(RTLD_DEFAULT, "dladdr") 来找 dladdr
+// 我们Hook dlsym，当它找 "dladdr" 时，把 new_dladdr 给它！
+void* new_dlsym(void * __handle, const char * __symbol) {
+    if (__symbol) {
+        // 🎯 拦截对 dladdr 的查询
+        if (strcmp(__symbol, "dladdr") == 0) {
+            NSLog(@"[Stealth] 🎣 拦截到 dlsym 查询 dladdr，返回假函数指针");
+            return (void *)new_dladdr;
+        }
+        
+        // 可选：拦截对 bundleIdentifier 的查询 (防止 dlsym 直接查 IMP)
+        if (strcmp(__symbol, "bundleIdentifier") == 0) {
+            // 这里比较复杂，通常 Swizzle 已经处理了 IMP，dlsym 查到的可能是原 IMP
+            // 暂时不处理，专注于拦截 dladdr
+        }
+    }
+    
+    if (orig_dlsym) return orig_dlsym(__handle, __symbol);
+    return NULL;
 }
 
 @implementation NSBundle (Stealth)
@@ -185,34 +220,35 @@ int new_dladdr(const void *addr, Dl_info *info) {
         
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-            NSLog(@"[Stealth] ⚡️ 震动触发");
         });
 
         dispatch_async(dispatch_get_main_queue(), ^{
             NSLog(@"[Stealth] 🚀 主线程启动...");
             
-            // 0. IO 准备
+            // 0. 准备 IO 假文件
             [self prepareFakeInfoPlist];
             
-            // A. OC Swizzle (攻克 1, 3)
+            // A. OC Swizzle (1, 3)
             [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
             [self swizzleInstanceMethod:@selector(infoDictionary) with:@selector(hook_infoDictionary)];
             [self swizzleInstanceMethod:@selector(pathForResource:ofType:) with:@selector(hook_pathForResource:ofType:)];
             
-            // B. Fishhook (攻克 2, 4, 5, 8)
+            // B. Fishhook (2, 4, 5, 8)
             struct rebind_entry rebinds[] = {
                 {"CFBundleGetIdentifier", (void *)new_CFBundleGetIdentifier, (void **)&orig_CFBundleGetIdentifier},
                 {"fopen", (void *)new_fopen, (void **)&orig_fopen},
                 {"SecTaskCopySigningIdentifier", (void *)new_SecTaskCopySigningIdentifier, (void **)&orig_SecTaskCopySigningIdentifier},
-                // 🟢 新增：拦截 dladdr
-                {"dladdr", (void *)new_dladdr, (void **)&orig_dladdr}
+                // 🟢 关键组合拳：同时 Hook dlsym 和 dladdr
+                {"dladdr", (void *)new_dladdr, (void **)&orig_dladdr},
+                {"dlsym", (void *)new_dlsym, (void **)&orig_dlsym}
             };
             
             const struct mach_header *header = _dyld_get_image_header(0);
             intptr_t slide = _dyld_get_image_vmaddr_slide(0);
             if (header) {
-                rebind_data_symbols(header, slide, rebinds, 4);
-                NSLog(@"[Stealth] ✅ 六项全能 (含反Swizzle检测) 已部署");
+                // 启用 VM_PROTECT 模式，扫描 __DATA_CONST
+                rebind_data_symbols(header, slide, rebinds, 5);
+                NSLog(@"[Stealth] ✅ 六项全能 + 反检测已部署");
             }
         });
     });
