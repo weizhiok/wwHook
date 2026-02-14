@@ -13,7 +13,7 @@ static NSString * const kTargetBundleID = @"com.user.bundlechecker";
 // =======================================================
 
 // ----------------------------------------------------------------
-// 🧩 Fishhook Mini Implementation (为了不依赖外部库，直接内嵌)
+// 🧩 Fishhook Mini Implementation
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -69,7 +69,7 @@ static void rebind_symbols_image(const struct mach_header *header,
 
     cur_seg_cmd = (segment_command_t *)((uintptr_t)header + sizeof(mach_header_t));
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
-        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT && strcmp(cur_seg_cmd->segname, "__DATA") == 0) { // On iOS, it's usually __DATA or __DATA_CONST
+        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT && strcmp(cur_seg_cmd->segname, "__DATA") == 0) {
             section_t *sect = (section_t *)((uintptr_t)cur_seg_cmd + sizeof(segment_command_t));
             for (uint j = 0; j < cur_seg_cmd->nsects; j++, sect++) {
                 if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS || (sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
@@ -80,7 +80,7 @@ static void rebind_symbols_image(const struct mach_header *header,
                         if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL || symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
                         uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
                         char *symbol_name = strtab + strtab_offset;
-                        if (strtab_offset == 0 || symbol_name[0] == '\0') continue; // Avoid empty symbol names
+                        if (strtab_offset == 0 || symbol_name[0] == '\0') continue;
                         
                         bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
                         for (uint l = 0; l < nrebinds; l++) {
@@ -119,7 +119,6 @@ static int (*orig_dladdr)(const void *, Dl_info *);
 // 🛡️ C Hook 实现
 // ----------------------------------------------------------------
 
-// 1. Hook CFBundleGetIdentifier (覆盖 C API 检测)
 CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
     if (bundle == CFBundleGetMainBundle()) {
         return (__bridge CFStringRef)kTargetBundleID;
@@ -127,37 +126,30 @@ CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
     return orig_CFBundleGetIdentifier(bundle);
 }
 
-// 2. Hook SecTaskCopyValueForEntitlement (覆盖 Entitlements 检测)
 CFTypeRef new_SecTaskCopyValueForEntitlement(id task, CFStringRef entitlement, CFErrorRef *error) {
     if (CFStringCompare(entitlement, CFSTR("application-identifier"), 0) == kCFCompareEqualTo) {
-        // 构造一个假的 TeamID.BundleID 格式
-        // 注意：如果你知道真实的 TeamID，最好写成真实的，这里随便模拟一个
         return (__bridge CFTypeRef)[NSString stringWithFormat:@"ABCDE12345.%@", kTargetBundleID];
     }
     return orig_SecTaskCopyValueForEntitlement(task, entitlement, error);
 }
 
-// 3. Hook SecTaskCopySigningIdentifier (覆盖 SecTask 检测)
 CFStringRef new_SecTaskCopySigningIdentifier(id task, CFErrorRef *error) {
     return (__bridge CFStringRef)kTargetBundleID;
 }
 
-// 4. Hook dladdr (核心：覆盖 Runtime Swizzle 检测)
-// 当检测代码查我的 Hook 函数地址时，我返回系统库的路径，骗过检测
+// 核心修复点：dladdr 欺骗
 int new_dladdr(const void *addr, Dl_info *info) {
     int result = orig_dladdr(addr, info);
     
     if (result != 0 && info) {
-        // 检查这个地址是不是我们自己的 Hook 函数
-        // 如果检测代码问：这个函数是谁写的？
-        // 我们回答：是 Foundation 系统库写的。
         NSString *fname = [NSString stringWithUTF8String:info->dli_fname];
+        // 如果检测代码发现了我们
         if ([fname containsString:@"StealthBundleID"] || [fname containsString:@"BundleChecker"]) {
-             // 找到系统 Foundation 库的地址作为伪装掩体
+             // 🟢 修复：添加 (__bridge const void *) 进行转换
             Dl_info sysInfo;
-            if (orig_dladdr((const void *)objc_getClass("NSString"), &sysInfo)) {
+            if (orig_dladdr((__bridge const void *)objc_getClass("NSString"), &sysInfo)) {
                 info->dli_fname = sysInfo.dli_fname;
-                info->dli_sname = "CFStringCreateWithCString"; // 随便编个系统函数名
+                info->dli_sname = "CFStringCreateWithCString";
             }
         }
     }
