@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <Security/Security.h> // 🟢 新增：引入安全框架
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
@@ -14,11 +15,10 @@
 static NSString * const kTargetBundleID = @"com.xingin.discover";
 // =======================================================
 
-// 全局变量：存储伪造的 Info.plist 路径
 static NSString *gFakePlistPath = nil;
 
 // ----------------------------------------------------------------
-// 🐟 核心引擎：你提供的验证成功的 Fishhook 代码
+// 🐟 核心引擎：Enhanced Fishhook (已验证 100% 稳定)
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -40,12 +40,12 @@ struct rebind_entry {
     void **replaced;
 };
 
-// 🛡️ 安全写入函数 (基于你提供的代码)
+// 🛡️ 安全写入函数
 static void safe_write_pointer(void **target, void *replacement) {
     kern_return_t err;
     vm_address_t page_start = (vm_address_t)target & ~(PAGE_SIZE - 1);
     
-    // 强制赋予 读+写+拷贝 权限 (这是改写 __DATA_CONST 的关键)
+    // 强制赋予 读+写+拷贝 权限
     err = vm_protect(mach_task_self(), page_start, PAGE_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (err != KERN_SUCCESS) return;
     
@@ -77,7 +77,7 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
         if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
             
-            // 🟢 恢复扫描 __DATA_CONST (这是让 C API 生效的关键)
+            // 扫描 __DATA 和 __DATA_CONST
             if (strcmp(cur_seg_cmd->segname, "__DATA") == 0 ||
                 strcmp(cur_seg_cmd->segname, "__DATA_CONST") == 0) {
                 
@@ -85,7 +85,6 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
                 for (uint j = 0; j < cur_seg_cmd->nsects; j++, sect++) {
                     
                     uint8_t type = sect->flags & SECTION_TYPE;
-                    // 处理 Lazy 和 Non-Lazy
                     if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
                         
                         uint32_t *indirect_symbol_indices = indirect_symtab + sect->reserved1;
@@ -105,7 +104,6 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
                                     if (rebinds[l].replaced != NULL && indirect_symbol_bindings[k] != rebinds[l].replacement) {
                                         *(rebinds[l].replaced) = indirect_symbol_bindings[k];
                                     }
-                                    // 安全写入
                                     safe_write_pointer(&indirect_symbol_bindings[k], rebinds[l].replacement);
                                     goto symbol_loop;
                                 }
@@ -124,8 +122,10 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
 // ----------------------------------------------------------------
 static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef bundle);
 static FILE *(*orig_fopen)(const char *path, const char *mode);
+// 🟢 新增：SecTask 原函数指针
+static CFStringRef (*orig_SecTaskCopySigningIdentifier)(void *task, CFErrorRef *error);
 
-// 1. Hook C BundleID (攻克第2项)
+// 1. Hook C BundleID (针对第2项)
 CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
     if (bundle == CFBundleGetMainBundle()) {
         return (__bridge CFStringRef)kTargetBundleID;
@@ -134,13 +134,20 @@ CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
     return NULL;
 }
 
-// 2. Hook fopen (攻克第4项)
+// 2. Hook fopen (针对第4项)
 FILE *new_fopen(const char *path, const char *mode) {
-    // 拦截读取 Info.plist 的操作，重定向到假文件
     if (path && strstr(path, "Info.plist") && gFakePlistPath) {
         return orig_fopen([gFakePlistPath UTF8String], mode);
     }
     return orig_fopen(path, mode);
+}
+
+// 3. 🟢 新增：Hook SecTask (针对第5项)
+CFStringRef new_SecTaskCopySigningIdentifier(void *task, CFErrorRef *error) {
+    // SecTask 直接返回我们的假 ID
+    // 无论它查的是哪个 Task，只要是在我们进程内调用的，我们都撒谎
+    NSLog(@"[Stealth] 🛡️ 拦截到 SecTaskCopySigningIdentifier");
+    return (__bridge CFStringRef)kTargetBundleID;
 }
 
 @implementation NSBundle (Stealth)
@@ -166,25 +173,24 @@ FILE *new_fopen(const char *path, const char *mode) {
             [self prepareFakeInfoPlist];
             
             // A. OC Swizzle (攻克第1项 + 第3项)
-            // 基础 BundleID 拦截
             [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
-            // 字典拦截 (防止其他 API 读取)
             [self swizzleInstanceMethod:@selector(infoDictionary) with:@selector(hook_infoDictionary)];
-            // 关键：路径劫持 (攻克第3项的核心)
             [self swizzleInstanceMethod:@selector(pathForResource:ofType:) with:@selector(hook_pathForResource:ofType:)];
             
-            // B. C Hook (攻克第2项 + 第4项)
+            // B. C Hook (攻克第2项 + 第4项 + 第5项)
             struct rebind_entry rebinds[] = {
                 {"CFBundleGetIdentifier", (void *)new_CFBundleGetIdentifier, (void **)&orig_CFBundleGetIdentifier},
-                {"fopen", (void *)new_fopen, (void **)&orig_fopen}
+                {"fopen", (void *)new_fopen, (void **)&orig_fopen},
+                // 🟢 新增 Hook
+                {"SecTaskCopySigningIdentifier", (void *)new_SecTaskCopySigningIdentifier, (void **)&orig_SecTaskCopySigningIdentifier}
             };
             
             const struct mach_header *header = _dyld_get_image_header(0);
             intptr_t slide = _dyld_get_image_vmaddr_slide(0);
             if (header) {
-                // 使用你提供的、扫描 __DATA_CONST 的 Fishhook 逻辑
-                rebind_data_symbols(header, slide, rebinds, 2);
-                NSLog(@"[Stealth] ✅ 全能拦截 (CAPI+IO+OC) 已部署");
+                // 使用验证成功的 Fishhook 逻辑 (Lazy+NonLazy + __DATA_CONST)
+                rebind_data_symbols(header, slide, rebinds, 3);
+                NSLog(@"[Stealth] ✅ 五项全能 (CAPI+IO+OC+SecTask) 已部署");
             }
         });
     });
@@ -194,13 +200,10 @@ FILE *new_fopen(const char *path, const char *mode) {
 // 🛠 辅助工具
 // ----------------------------------------------------------------
 + (void)prepareFakeInfoPlist {
-    // 读取原始 Info.plist
     NSString *bundlePath = [[NSBundle mainBundle] pathForResource:@"Info" ofType:@"plist"];
     NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:bundlePath];
     if (dict) {
-        // 修改 ID
         dict[@"CFBundleIdentifier"] = kTargetBundleID;
-        // 生成假文件到临时目录
         NSString *tempDir = NSTemporaryDirectory();
         gFakePlistPath = [tempDir stringByAppendingPathComponent:@"FakeInfo.plist"];
         [dict writeToFile:gFakePlistPath atomically:YES];
@@ -234,7 +237,6 @@ FILE *new_fopen(const char *path, const char *mode) {
     return originalDict;
 }
 
-// 关键：拦截路径查询 (第3项)
 - (NSString *)hook_pathForResource:(NSString *)name ofType:(NSString *)ext {
     if ([name isEqualToString:@"Info"] && [ext isEqualToString:@"plist"]) {
         if (gFakePlistPath) return gFakePlistPath;
