@@ -17,7 +17,30 @@ static NSString * const kTargetBundleID = @"com.xingin.discover";
 static NSString *gFakePlistPath = nil;
 
 // ----------------------------------------------------------------
-// 🐟 增强版 Fishhook (支持 Lazy + Non-Lazy, 仅限 __DATA)
+// 🎭 FakeBundle (ISA Swizzling 专用)
+// ----------------------------------------------------------------
+@interface FakeBundle : NSBundle
+@end
+
+@implementation FakeBundle
+- (NSString *)bundleIdentifier { return kTargetBundleID; }
+- (NSDictionary *)infoDictionary {
+    NSDictionary *dict = [super infoDictionary];
+    if (dict) {
+        NSMutableDictionary *newDict = [dict mutableCopy];
+        newDict[@"CFBundleIdentifier"] = kTargetBundleID;
+        return newDict;
+    }
+    return dict;
+}
+- (id)objectForInfoDictionaryKey:(NSString *)key {
+    if ([key isEqualToString:@"CFBundleIdentifier"]) return kTargetBundleID;
+    return [super objectForInfoDictionaryKey:key];
+}
+@end
+
+// ----------------------------------------------------------------
+// 🐟 Fishhook (Lazy Only - 绝对防闪退)
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -39,7 +62,6 @@ struct rebind_entry {
     void **replaced;
 };
 
-// 🛡️ 安全写入
 static void safe_write_pointer(void **target, void *replacement) {
     kern_return_t err;
     vm_address_t page_start = (vm_address_t)target & ~(PAGE_SIZE - 1);
@@ -72,28 +94,20 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
     cur_seg_cmd = (segment_command_t *)((uintptr_t)header + sizeof(mach_header_t));
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
         if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            
-            // 🟢 关键：只处理 __DATA (可读写区)，剔除 __DATA_CONST (防止 3秒闪退)
+            // 🟢 只处理 __DATA (防闪退核心)
             if (strcmp(cur_seg_cmd->segname, "__DATA") == 0) {
-                
                 section_t *sect = (section_t *)((uintptr_t)cur_seg_cmd + sizeof(segment_command_t));
                 for (uint j = 0; j < cur_seg_cmd->nsects; j++, sect++) {
-                    
-                    // 🟢 关键：同时覆盖 [Lazy] 和 [Non-Lazy]
-                    uint8_t type = sect->flags & SECTION_TYPE;
-                    if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
-                        
+                    // 🟢 只处理 Lazy Symbols (最稳)
+                    if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
                         uint32_t *indirect_symbol_indices = indirect_symtab + sect->reserved1;
                         void **indirect_symbol_bindings = (void **)((uintptr_t)slide + sect->addr);
-                        
                         for (uint k = 0; k < sect->size / sizeof(void *); k++) {
                             uint32_t symtab_index = indirect_symbol_indices[k];
                             if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
                                 symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
-                            
                             uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
                             char *symbol_name = strtab + strtab_offset;
-                            
                             bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
                             for (uint l = 0; l < nrebinds; l++) {
                                 if (symbol_name_longer_than_1 && strcmp(&symbol_name[1], rebinds[l].name) == 0) {
@@ -114,28 +128,20 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
 }
 
 // ----------------------------------------------------------------
-// 🛡️ C Hook 函数集
+// 🛡️ C Hook 函数
 // ----------------------------------------------------------------
 static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef bundle);
 static FILE *(*orig_fopen)(const char *path, const char *mode);
 
-// 1. Hook C API (针对第2项)
 CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
-    // 简单粗暴：只要是主包，直接返回假ID
-    if (bundle == CFBundleGetMainBundle()) {
-        return (__bridge CFStringRef)kTargetBundleID;
-    }
+    if (bundle == CFBundleGetMainBundle()) return (__bridge CFStringRef)kTargetBundleID;
     if (orig_CFBundleGetIdentifier) return orig_CFBundleGetIdentifier(bundle);
     return NULL;
 }
 
-// 2. Hook fopen (针对第4项)
 FILE *new_fopen(const char *path, const char *mode) {
-    if (path && strstr(path, "Info.plist")) {
-        // 如果有假文件，重定向过去
-        if (gFakePlistPath) {
-            return orig_fopen([gFakePlistPath UTF8String], mode);
-        }
+    if (path && strstr(path, "Info.plist") && gFakePlistPath) {
+        return orig_fopen([gFakePlistPath UTF8String], mode);
     }
     return orig_fopen(path, mode);
 }
@@ -155,36 +161,69 @@ FILE *new_fopen(const char *path, const char *mode) {
             NSLog(@"[Stealth] ⚡️ 震动触发");
         });
 
-        // 2. 主线程部署 (避开启动检查)
+        // 2. 主线程部署
         dispatch_async(dispatch_get_main_queue(), ^{
             NSLog(@"[Stealth] 🚀 主线程启动...");
             
-            // 0. 准备假文件 (为了攻克 IO)
+            // 0. 准备假文件 (IO 核心)
             [self prepareFakeInfoPlist];
             
-            // A. OC Swizzle (针对第1项 + 第3项)
-            [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
-            [self swizzleInstanceMethod:@selector(infoDictionary) with:@selector(hook_infoDictionary)];
+            // A. 执行 ISA Swizzling (狸猫换太子)
+            // 这是攻克 OC API 和部分 C API 的强力手段
+            NSBundle *mainBundle = [NSBundle mainBundle];
+            if (mainBundle) {
+                object_setClass(mainBundle, [FakeBundle class]);
+            }
             
-            // 🟢 关键：路径劫持 (针对第3项)
+            // B. 🟢 关键新增：Ivar 缓存注入 (针对 C API 读取缓存的情况)
+            // 很多时候 C API 不读 infoDictionary，而是读 _bundleIdentifier 这个变量
+            [self injectIvars:mainBundle];
+
+            // C. 兜底 OC Hook (IO 核心)
             [self swizzleInstanceMethod:@selector(pathForResource:ofType:) with:@selector(hook_pathForResource:ofType:)];
+            // 虽然 ISA Swizzling 做了，但 pathForResource 是基类方法，Swizzle 一下更稳
             
-            // B. C Hook (针对第2项 + 第4项)
+            // D. Fishhook (Lazy + fopen)
             struct rebind_entry rebinds[] = {
                 {"CFBundleGetIdentifier", (void *)new_CFBundleGetIdentifier, (void **)&orig_CFBundleGetIdentifier},
                 {"fopen", (void *)new_fopen, (void **)&orig_fopen}
             };
-            
-            // 针对主程序 (Image 0) 执行安全 Hook
             const struct mach_header *header = _dyld_get_image_header(0);
             intptr_t slide = _dyld_get_image_vmaddr_slide(0);
             if (header) {
-                // 扫描 __DATA 段的 Lazy 和 Non-Lazy 表
                 rebind_data_symbols(header, slide, rebinds, 2);
-                NSLog(@"[Stealth] ✅ 全能拦截 (OC+C+IO) 已部署");
             }
+            
+            NSLog(@"[Stealth] ✅ 四位一体 (IO+ISA+Ivar+Lazy) 已部署");
         });
     });
+}
+
+// ----------------------------------------------------------------
+// 🛠 核心：Ivar 注入 (修改内部缓存)
+// ----------------------------------------------------------------
++ (void)injectIvars:(NSBundle *)bundle {
+    if (!bundle) return;
+    
+    // 1. 修改 _infoDictionary
+    Ivar infoDictIvar = class_getInstanceVariable([NSBundle class], "_infoDictionary");
+    if (infoDictIvar) {
+        NSDictionary *originalDict = object_getIvar(bundle, infoDictIvar);
+        if (originalDict) {
+            NSMutableDictionary *newDict = [originalDict mutableCopy];
+            newDict[@"CFBundleIdentifier"] = kTargetBundleID;
+            object_setIvar(bundle, infoDictIvar, newDict);
+        }
+    }
+    
+    // 2. 🟢 关键：修改 _bundleIdentifier (字符串缓存)
+    // 这是 NSBundle 内部缓存 ID 的地方
+    Ivar idIvar = class_getInstanceVariable([NSBundle class], "_bundleIdentifier");
+    if (idIvar) {
+        // 直接把缓存的字符串换成我们的！
+        object_setIvar(bundle, idIvar, kTargetBundleID);
+        NSLog(@"[Stealth] 💉 已强制篡改 _bundleIdentifier 缓存");
+    }
 }
 
 // ----------------------------------------------------------------
@@ -212,24 +251,6 @@ FILE *new_fopen(const char *path, const char *mode) {
     }
 }
 
-// ----------------------------------------------------------------
-// 🛡️ OC Hooks
-// ----------------------------------------------------------------
-
-// 针对第1项
-- (NSString *)hook_bundleIdentifier { return kTargetBundleID; }
-
-- (NSDictionary *)hook_infoDictionary {
-    NSDictionary *originalDict = [self hook_infoDictionary];
-    if (originalDict && [originalDict isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *newDict = [originalDict mutableCopy];
-        newDict[@"CFBundleIdentifier"] = kTargetBundleID;
-        return newDict;
-    }
-    return originalDict;
-}
-
-// 针对第3项 (路径劫持)
 - (NSString *)hook_pathForResource:(NSString *)name ofType:(NSString *)ext {
     if ([name isEqualToString:@"Info"] && [ext isEqualToString:@"plist"]) {
         if (gFakePlistPath) return gFakePlistPath;
