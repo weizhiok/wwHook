@@ -14,8 +14,11 @@
 static NSString * const kTargetBundleID = @"com.xingin.discover";
 // =======================================================
 
+// 全局变量：用于存储我们伪造的 Info.plist 文件的路径
+static NSString *gFakePlistPath = nil;
+
 // ----------------------------------------------------------------
-// 🐟 安全版 Fishhook (只改 Lazy，绝不碰 Non-Lazy)
+// 🐟 增强版 Fishhook (支持 Lazy + Non-Lazy)
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -37,7 +40,6 @@ struct rebind_entry {
     void **replaced;
 };
 
-// 🛡️ 安全写入 (保留，用于写入 Lazy 表)
 static void safe_write_pointer(void **target, void *replacement) {
     kern_return_t err;
     vm_address_t page_start = (vm_address_t)target & ~(PAGE_SIZE - 1);
@@ -46,7 +48,7 @@ static void safe_write_pointer(void **target, void *replacement) {
     *target = replacement;
 }
 
-static void rebind_lazy_symbols(const struct mach_header *header, intptr_t slide, struct rebind_entry *rebinds, size_t nrebinds) {
+static void rebind_data_symbols(const struct mach_header *header, intptr_t slide, struct rebind_entry *rebinds, size_t nrebinds) {
     segment_command_t *cur_seg_cmd;
     segment_command_t *linkedit_segment = NULL;
     struct symtab_command* symtab_cmd = NULL;
@@ -70,27 +72,21 @@ static void rebind_lazy_symbols(const struct mach_header *header, intptr_t slide
     cur_seg_cmd = (segment_command_t *)((uintptr_t)header + sizeof(mach_header_t));
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
         if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            
-            // 🟢 只扫描 __DATA
-            if (strcmp(cur_seg_cmd->segname, "__DATA") == 0) {
+            if (strcmp(cur_seg_cmd->segname, "__DATA") == 0 ||
+                strcmp(cur_seg_cmd->segname, "__DATA_CONST") == 0) {
+                
                 section_t *sect = (section_t *)((uintptr_t)cur_seg_cmd + sizeof(segment_command_t));
                 for (uint j = 0; j < cur_seg_cmd->nsects; j++, sect++) {
-                    
-                    // 🟢 绝对不碰 S_NON_LAZY_SYMBOL_POINTERS (那是闪退之源)
-                    // 只处理 S_LAZY_SYMBOL_POINTERS
-                    if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
-                        
+                    uint8_t type = sect->flags & SECTION_TYPE;
+                    if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
                         uint32_t *indirect_symbol_indices = indirect_symtab + sect->reserved1;
                         void **indirect_symbol_bindings = (void **)((uintptr_t)slide + sect->addr);
-                        
                         for (uint k = 0; k < sect->size / sizeof(void *); k++) {
                             uint32_t symtab_index = indirect_symbol_indices[k];
                             if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
                                 symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
-                            
                             uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
                             char *symbol_name = strtab + strtab_offset;
-                            
                             bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
                             for (uint l = 0; l < nrebinds; l++) {
                                 if (symbol_name_longer_than_1 && strcmp(&symbol_name[1], rebinds[l].name) == 0) {
@@ -111,35 +107,35 @@ static void rebind_lazy_symbols(const struct mach_header *header, intptr_t slide
 }
 
 // ----------------------------------------------------------------
-// 🛡️ C Hook 函数
+// 🛡️ C Hook 函数集
 // ----------------------------------------------------------------
 static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef bundle);
-static void* (*orig_dlsym)(void * __handle, const char * __symbol);
+static FILE *(*orig_fopen)(const char *path, const char *mode); // 新增
 
-// 1. 我们的假 BundleID 获取函数
+// 1. Hook CFBundleGetIdentifier
 CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
-    // 只要是查主包，就给假的
     if (bundle == CFBundleGetMainBundle()) {
         return (__bridge CFStringRef)kTargetBundleID;
     }
-    // 为了防止递归或空指针，尽量不调 orig，直接返回 NULL 让系统处理，或者硬着头皮调
-    // 简单起见，这里假设我们只关心主包
     if (orig_CFBundleGetIdentifier) return orig_CFBundleGetIdentifier(bundle);
     return NULL;
 }
 
-// 2. 🟢 核心大招：拦截 dlsym
-// 如果检测工具试图通过 dlsym(RTLD_DEFAULT, "CFBundleGetIdentifier") 来绕过我们
-// 我们就拦截 dlsym，直接把假函数的地址给它！
-void* new_dlsym(void * __handle, const char * __symbol) {
-    if (__symbol && strcmp(__symbol, "CFBundleGetIdentifier") == 0) {
-        NSLog(@"[Stealth] 🕵️‍♂️ 拦截到 dlsym 查询 CFBundleGetIdentifier，返回假地址！");
-        return (void *)new_CFBundleGetIdentifier;
+// 2. Hook fopen (IO 检测的核心)
+FILE *new_fopen(const char *path, const char *mode) {
+    if (path) {
+        // 如果正在尝试打开 Info.plist
+        if (strstr(path, "Info.plist")) {
+            NSLog(@"[Stealth] 🕵️‍♂️ 拦截到 fopen 读取 Info.plist: %s", path);
+            
+            // 如果我们已经准备好了假的 plist 文件，就重定向过去
+            if (gFakePlistPath) {
+                NSLog(@"[Stealth] ↪️ 重定向到伪造文件: %@", gFakePlistPath);
+                return orig_fopen([gFakePlistPath UTF8String], mode);
+            }
+        }
     }
-    if (orig_dlsym) {
-        return orig_dlsym(__handle, __symbol);
-    }
-    return NULL;
+    return orig_fopen(path, mode);
 }
 
 @implementation NSBundle (Stealth)
@@ -154,61 +150,123 @@ void* new_dlsym(void * __handle, const char * __symbol) {
         // 1. 震动反馈
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+            NSLog(@"[Stealth] ⚡️ 震动触发");
         });
 
         // 2. 主线程部署
         dispatch_async(dispatch_get_main_queue(), ^{
             NSLog(@"[Stealth] 🚀 主线程启动...");
             
-            // A. OC Swizzle (Ivar + Method, 保持不变，这是防线基础)
-            [self injectModifiedDictionary];
-            [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
+            // 0. 准备工作：生成假的 Info.plist 文件 (为 fopen 重定向做准备)
+            [self prepareFakeInfoPlist];
             
-            // B. C Hook (Lazy Only + dlsym)
+            // A. OC Swizzle (新增了 NSDictionary 的 Hook)
+            [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
+            [self swizzleInstanceMethod:@selector(infoDictionary) with:@selector(hook_infoDictionary)];
+            
+            // 针对 NSDictionary 的 IO 读取进行拦截
+            [self swizzleClassMethod:[NSDictionary class] original:@selector(dictionaryWithContentsOfFile:) new:@selector(hook_dictionaryWithContentsOfFile:)];
+            [self swizzleInstanceMethod:[NSDictionary class] original:@selector(initWithContentsOfFile:) new:@selector(hook_initWithContentsOfFile:)];
+            
+            // B. C Hook (新增 fopen)
             struct rebind_entry rebinds[] = {
-                // Hook CFBundleGetIdentifier (如果它是懒加载的)
                 {"CFBundleGetIdentifier", (void *)new_CFBundleGetIdentifier, (void **)&orig_CFBundleGetIdentifier},
-                // Hook dlsym (防止动态查询绕过)
-                {"dlsym", (void *)new_dlsym, (void **)&orig_dlsym}
+                {"fopen", (void *)new_fopen, (void **)&orig_fopen}
             };
             
-            // C. 仅对主程序执行 Hook
             const struct mach_header *header = _dyld_get_image_header(0);
             intptr_t slide = _dyld_get_image_vmaddr_slide(0);
             if (header) {
-                // 只扫描懒加载表！绝对不碰非懒加载表！(防闪退)
-                rebind_lazy_symbols(header, slide, rebinds, 2);
-                NSLog(@"[Stealth] ✅ 懒加载表 Hook + dlsym 拦截已部署");
+                rebind_data_symbols(header, slide, rebinds, 2);
+                NSLog(@"[Stealth] ✅ Fishhook (CAPI + IO) 已执行");
             }
         });
     });
 }
 
 // ----------------------------------------------------------------
-// 🛠 OC Hooks
+// 🛠 辅助工具：生成假的 Info.plist
 // ----------------------------------------------------------------
-+ (void)injectModifiedDictionary {
-    NSBundle *mainBundle = [NSBundle mainBundle];
-    NSDictionary *originalDict = [mainBundle infoDictionary];
-    if (originalDict) {
-        NSMutableDictionary *newDict = [originalDict mutableCopy];
-        newDict[@"CFBundleIdentifier"] = kTargetBundleID;
-        Ivar ivar = class_getInstanceVariable([NSBundle class], "_infoDictionary");
-        if (ivar) object_setIvar(mainBundle, ivar, newDict);
++ (void)prepareFakeInfoPlist {
+    // 读取原始 Info.plist
+    NSString *bundlePath = [[NSBundle mainBundle] pathForResource:@"Info" ofType:@"plist"];
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:bundlePath];
+    
+    if (dict) {
+        // 修改 BundleID
+        dict[@"CFBundleIdentifier"] = kTargetBundleID;
+        
+        // 将修改后的字典写入临时目录
+        NSString *tempDir = NSTemporaryDirectory();
+        gFakePlistPath = [tempDir stringByAppendingPathComponent:@"FakeInfo.plist"];
+        
+        [dict writeToFile:gFakePlistPath atomically:YES];
+        NSLog(@"[Stealth] 📝 伪造的 Info.plist 已生成: %@", gFakePlistPath);
     }
 }
 
-+ (void)swizzleInstanceMethod:(SEL)originalSel with:(SEL)newSel {
-    Class class = [self class];
-    Method originalMethod = class_getInstanceMethod(class, originalSel);
-    Method newMethod = class_getInstanceMethod(class, newSel);
-    if (class_addMethod(class, originalSel, method_getImplementation(newMethod), method_getTypeEncoding(newMethod))) {
-        class_replaceMethod(class, newSel, method_getImplementation(originalMethod), method_getTypeEncoding(originalMethod));
+// ----------------------------------------------------------------
+// 🛠 Swizzle 工具函数 (区分 Class 和 Instance)
+// ----------------------------------------------------------------
++ (void)swizzleInstanceMethod:(Class)cls original:(SEL)originalSel new:(SEL)newSel {
+    Method originalMethod = class_getInstanceMethod(cls, originalSel);
+    Method newMethod = class_getInstanceMethod(cls, newSel);
+    if (class_addMethod(cls, originalSel, method_getImplementation(newMethod), method_getTypeEncoding(newMethod))) {
+        class_replaceMethod(cls, newSel, method_getImplementation(originalMethod), method_getTypeEncoding(originalMethod));
     } else {
         method_exchangeImplementations(originalMethod, newMethod);
     }
 }
 
++ (void)swizzleInstanceMethod:(SEL)originalSel with:(SEL)newSel {
+    [self swizzleInstanceMethod:[self class] original:originalSel new:newSel];
+}
+
++ (void)swizzleClassMethod:(Class)cls original:(SEL)originalSel new:(SEL)newSel {
+    Method originalMethod = class_getClassMethod(cls, originalSel);
+    Method newMethod = class_getClassMethod(cls, newSel);
+    method_exchangeImplementations(originalMethod, newMethod);
+}
+
+// ----------------------------------------------------------------
+// 🛡️ OC Hooks (新增 NSDictionary)
+// ----------------------------------------------------------------
+
 - (NSString *)hook_bundleIdentifier { return kTargetBundleID; }
+
+- (NSDictionary *)hook_infoDictionary {
+    NSDictionary *originalDict = [self hook_infoDictionary];
+    if (originalDict && [originalDict isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *newDict = [originalDict mutableCopy];
+        newDict[@"CFBundleIdentifier"] = kTargetBundleID;
+        return newDict;
+    }
+    return originalDict;
+}
+
+@end
+
+// ----------------------------------------------------------------
+// 🛡️ NSDictionary Hook 实现 (放在新的 Category 里避免混乱)
+// ----------------------------------------------------------------
+@implementation NSDictionary (StealthIO)
+
+// 类方法 Hook
++ (NSDictionary *)hook_dictionaryWithContentsOfFile:(NSString *)path {
+    // 如果是读取 Info.plist，直接返回我们内存中生成的伪装字典
+    // 或者重定向到假文件路径 (这里直接读假文件更方便)
+    if ([path hasSuffix:@"Info.plist"] && gFakePlistPath) {
+        return [self hook_dictionaryWithContentsOfFile:gFakePlistPath];
+    }
+    return [self hook_dictionaryWithContentsOfFile:path];
+}
+
+// 实例方法 Hook
+- (instancetype)hook_initWithContentsOfFile:(NSString *)path {
+    if ([path hasSuffix:@"Info.plist"] && gFakePlistPath) {
+        return [self hook_initWithContentsOfFile:gFakePlistPath];
+    }
+    return [self hook_initWithContentsOfFile:path];
+}
 
 @end
