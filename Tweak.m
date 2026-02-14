@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <Security/Security.h> // 新增：用于 SecTask
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
@@ -15,7 +16,7 @@ static NSString * const kTargetBundleID = @"com.xingin.discover";
 // =======================================================
 
 // ----------------------------------------------------------------
-// 🐟 增强版 Fishhook (支持 Lazy + Non-Lazy)
+// 🐟 智能版 Fishhook (只改可变数据区)
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -37,15 +38,12 @@ struct rebind_entry {
     void **replaced;
 };
 
-// 🛡️ 安全写入函数 (防崩核心)
+// 🛡️ 安全写入
 static void safe_write_pointer(void **target, void *replacement) {
     kern_return_t err;
     vm_address_t page_start = (vm_address_t)target & ~(PAGE_SIZE - 1);
-    
-    // 强制赋予 读+写+拷贝 权限
     err = vm_protect(mach_task_self(), page_start, PAGE_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (err != KERN_SUCCESS) return;
-    
     *target = replacement;
 }
 
@@ -58,14 +56,9 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
     cur_seg_cmd = (segment_command_t *)((uintptr_t)header + sizeof(mach_header_t));
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
         if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            if (strcmp(cur_seg_cmd->segname, "__LINKEDIT") == 0) {
-                linkedit_segment = cur_seg_cmd;
-            }
-        } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
-            symtab_cmd = (struct symtab_command*)cur_seg_cmd;
-        } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
-            dysymtab_cmd = (struct dysymtab_command*)cur_seg_cmd;
-        }
+            if (strcmp(cur_seg_cmd->segname, "__LINKEDIT") == 0) linkedit_segment = cur_seg_cmd;
+        } else if (cur_seg_cmd->cmd == LC_SYMTAB) symtab_cmd = (struct symtab_command*)cur_seg_cmd;
+        else if (cur_seg_cmd->cmd == LC_DYSYMTAB) dysymtab_cmd = (struct dysymtab_command*)cur_seg_cmd;
     }
     
     if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment || !dysymtab_cmd->nindirectsyms) return;
@@ -78,16 +71,16 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
     cur_seg_cmd = (segment_command_t *)((uintptr_t)header + sizeof(mach_header_t));
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
         if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            // 🟢 扫描 __DATA 和 __DATA_CONST (包含 Lazy 和 Non-Lazy)
-            // 只要加上了 vm_protect，DATA_CONST 也是可以改的
-            if (strcmp(cur_seg_cmd->segname, "__DATA") == 0 ||
-                strcmp(cur_seg_cmd->segname, "__DATA_CONST") == 0) {
+            
+            // 🟢 关键修复：只处理 __DATA，坚决剔除 __DATA_CONST
+            // __DATA 是可变数据区，修改这里不会触发看门狗闪退
+            if (strcmp(cur_seg_cmd->segname, "__DATA") == 0) {
                 
                 section_t *sect = (section_t *)((uintptr_t)cur_seg_cmd + sizeof(segment_command_t));
                 for (uint j = 0; j < cur_seg_cmd->nsects; j++, sect++) {
                     
-                    // 🟢 核心升级：同时处理 [懒加载] 和 [非懒加载]
                     uint8_t type = sect->flags & SECTION_TYPE;
+                    // 处理 懒加载 和 非懒加载
                     if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
                         
                         uint32_t *indirect_symbol_indices = indirect_symtab + sect->reserved1;
@@ -107,7 +100,6 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
                                     if (rebinds[l].replaced != NULL && indirect_symbol_bindings[k] != rebinds[l].replacement) {
                                         *(rebinds[l].replaced) = indirect_symbol_bindings[k];
                                     }
-                                    // 🟢 安全写入
                                     safe_write_pointer(&indirect_symbol_bindings[k], rebinds[l].replacement);
                                     goto symbol_loop;
                                 }
@@ -122,16 +114,23 @@ static void rebind_data_symbols(const struct mach_header *header, intptr_t slide
 }
 
 // ----------------------------------------------------------------
-// 🛡️ C Hook 函数
+// 🛡️ C Hooks (新增 SecTask 支持)
 // ----------------------------------------------------------------
 static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef bundle);
+static CFStringRef (*orig_SecTaskCopySigningIdentifier)(void *task, CFErrorRef *error);
 
+// 1. 拦截 CFBundleGetIdentifier
 CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
     if (bundle == CFBundleGetMainBundle()) {
         return (__bridge CFStringRef)kTargetBundleID;
     }
     if (orig_CFBundleGetIdentifier) return orig_CFBundleGetIdentifier(bundle);
     return NULL;
+}
+
+// 2. 拦截 SecTaskCopySigningIdentifier (这也是个常用的 C 检测点)
+CFStringRef new_SecTaskCopySigningIdentifier(void *task, CFErrorRef *error) {
+    return (__bridge CFStringRef)kTargetBundleID;
 }
 
 @implementation NSBundle (Stealth)
@@ -153,30 +152,41 @@ CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
         dispatch_async(dispatch_get_main_queue(), ^{
             NSLog(@"[Stealth] 🚀 主线程启动...");
             
-            // A. OC Swizzle (保持不变)
+            // A. OC Swizzle (Ivar 手术 + Method Swizzle 双保险)
+            [self injectModifiedDictionary];
             [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
-            [self swizzleInstanceMethod:@selector(infoDictionary) with:@selector(hook_infoDictionary)];
             
-            // B. 增强版 C Hook (覆盖 Lazy + Non-Lazy)
+            // B. C Hook (Hook 两个关键 C 函数)
             struct rebind_entry rebinds[] = {
                 {"CFBundleGetIdentifier", (void *)new_CFBundleGetIdentifier, (void **)&orig_CFBundleGetIdentifier},
+                {"SecTaskCopySigningIdentifier", (void *)new_SecTaskCopySigningIdentifier, (void **)&orig_SecTaskCopySigningIdentifier}
             };
             
-            // ⚠️ 关键：只针对主程序 (Image 0)
+            // C. 针对主程序 (Image 0) 执行只读安全区的 Hook
             const struct mach_header *header = _dyld_get_image_header(0);
             intptr_t slide = _dyld_get_image_vmaddr_slide(0);
             if (header) {
-                // 这一次，我们扫描的范围更大了，但依然限制在安全的 __DATA 段
-                rebind_data_symbols(header, slide, rebinds, 1);
-                NSLog(@"[Stealth] ✅ 全能表(Lazy+NonLazy) Hook 已执行");
+                rebind_data_symbols(header, slide, rebinds, 2);
+                NSLog(@"[Stealth] ✅ C Hook (Lazy+NonLazy) 已执行");
             }
         });
     });
 }
 
 // ----------------------------------------------------------------
-// 🛠 OC Hooks
+// 🛠 OC Hooks & Ivar 注入
 // ----------------------------------------------------------------
++ (void)injectModifiedDictionary {
+    NSBundle *mainBundle = [NSBundle mainBundle];
+    NSDictionary *originalDict = [mainBundle infoDictionary];
+    if (originalDict) {
+        NSMutableDictionary *newDict = [originalDict mutableCopy];
+        newDict[@"CFBundleIdentifier"] = kTargetBundleID;
+        Ivar ivar = class_getInstanceVariable([NSBundle class], "_infoDictionary");
+        if (ivar) object_setIvar(mainBundle, ivar, newDict);
+    }
+}
+
 + (void)swizzleInstanceMethod:(SEL)originalSel with:(SEL)newSel {
     Class class = [self class];
     Method originalMethod = class_getInstanceMethod(class, originalSel);
@@ -189,15 +199,5 @@ CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
 }
 
 - (NSString *)hook_bundleIdentifier { return kTargetBundleID; }
-
-- (NSDictionary *)hook_infoDictionary {
-    NSDictionary *originalDict = [self hook_infoDictionary];
-    if (originalDict && [originalDict isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *newDict = [originalDict mutableCopy];
-        newDict[@"CFBundleIdentifier"] = kTargetBundleID;
-        return newDict;
-    }
-    return originalDict;
-}
 
 @end
