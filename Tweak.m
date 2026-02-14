@@ -9,13 +9,13 @@
 #import <objc/runtime.h>
 
 // =======================================================
-// ⚙️ 配置：目标假 ID
+// ⚙️ 配置：目标假 ID (已更新)
 // =======================================================
-static NSString * const kTargetBundleID = @"com.user.bundlechecker";
+static NSString * const kTargetBundleID = @"com.xingin.discover";
 // =======================================================
 
 // ----------------------------------------------------------------
-// 🐟 安全版 Fishhook (只针对 __la_symbol_ptr)
+// 🐟 增强版 Fishhook (支持 Lazy + Non-Lazy)
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -37,23 +37,19 @@ struct rebind_entry {
     void **replaced;
 };
 
-// 🛡️ 安全写入函数：确保有权限写入内存，防止 EXC_BAD_ACCESS
+// 🛡️ 安全写入函数 (防崩核心)
 static void safe_write_pointer(void **target, void *replacement) {
     kern_return_t err;
-    // 1. 获取当前内存页的权限
     vm_address_t page_start = (vm_address_t)target & ~(PAGE_SIZE - 1);
     
-    // 2. 临时提升权限为 可读+可写 (iOS 18 部分区域可能是只读的)
+    // 强制赋予 读+写+拷贝 权限
     err = vm_protect(mach_task_self(), page_start, PAGE_SIZE, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (err != KERN_SUCCESS) return; // 如果改不了权限，就放弃，保命要紧
+    if (err != KERN_SUCCESS) return;
     
-    // 3. 写入新指针
     *target = replacement;
-    
-    // 4. (可选) 恢复权限，但这步通常不关键，为了稳定可以省略
 }
 
-static void rebind_lazy_symbol(const struct mach_header *header, intptr_t slide, struct rebind_entry *rebinds, size_t nrebinds) {
+static void rebind_data_symbols(const struct mach_header *header, intptr_t slide, struct rebind_entry *rebinds, size_t nrebinds) {
     segment_command_t *cur_seg_cmd;
     segment_command_t *linkedit_segment = NULL;
     struct symtab_command* symtab_cmd = NULL;
@@ -82,14 +78,17 @@ static void rebind_lazy_symbol(const struct mach_header *header, intptr_t slide,
     cur_seg_cmd = (segment_command_t *)((uintptr_t)header + sizeof(mach_header_t));
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
         if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            // 🟢 关键限制：只扫描 __DATA 段 (最安全的读写区)
-            // ❌ 绝对不碰 __AUTH_CONST 或 __DATA_CONST (防止 PAC 崩溃)
-            if (strcmp(cur_seg_cmd->segname, "__DATA") == 0) {
+            // 🟢 扫描 __DATA 和 __DATA_CONST (包含 Lazy 和 Non-Lazy)
+            // 只要加上了 vm_protect，DATA_CONST 也是可以改的
+            if (strcmp(cur_seg_cmd->segname, "__DATA") == 0 ||
+                strcmp(cur_seg_cmd->segname, "__DATA_CONST") == 0) {
                 
                 section_t *sect = (section_t *)((uintptr_t)cur_seg_cmd + sizeof(segment_command_t));
                 for (uint j = 0; j < cur_seg_cmd->nsects; j++, sect++) {
-                    // 🟢 关键限制：只扫描 __la_symbol_ptr (懒加载指针)
-                    if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
+                    
+                    // 🟢 核心升级：同时处理 [懒加载] 和 [非懒加载]
+                    uint8_t type = sect->flags & SECTION_TYPE;
+                    if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
                         
                         uint32_t *indirect_symbol_indices = indirect_symtab + sect->reserved1;
                         void **indirect_symbol_bindings = (void **)((uintptr_t)slide + sect->addr);
@@ -108,7 +107,7 @@ static void rebind_lazy_symbol(const struct mach_header *header, intptr_t slide,
                                     if (rebinds[l].replaced != NULL && indirect_symbol_bindings[k] != rebinds[l].replacement) {
                                         *(rebinds[l].replaced) = indirect_symbol_bindings[k];
                                     }
-                                    // 🟢 使用安全写入
+                                    // 🟢 安全写入
                                     safe_write_pointer(&indirect_symbol_bindings[k], rebinds[l].replacement);
                                     goto symbol_loop;
                                 }
@@ -154,22 +153,22 @@ CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
         dispatch_async(dispatch_get_main_queue(), ^{
             NSLog(@"[Stealth] 🚀 主线程启动...");
             
-            // A. OC Swizzle (保持你的不闪退版本)
+            // A. OC Swizzle (保持不变)
             [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
             [self swizzleInstanceMethod:@selector(infoDictionary) with:@selector(hook_infoDictionary)];
             
-            // B. 极简版 C Hook
+            // B. 增强版 C Hook (覆盖 Lazy + Non-Lazy)
             struct rebind_entry rebinds[] = {
                 {"CFBundleGetIdentifier", (void *)new_CFBundleGetIdentifier, (void **)&orig_CFBundleGetIdentifier},
             };
             
-            // ⚠️ 只对主程序 (Index 0) 的 ⚠️ 懒加载表 (__la_symbol_ptr) 进行 Hook
-            // 这是目前 iOS 18 上唯一不崩的 C Hook 路径
+            // ⚠️ 关键：只针对主程序 (Image 0)
             const struct mach_header *header = _dyld_get_image_header(0);
             intptr_t slide = _dyld_get_image_vmaddr_slide(0);
             if (header) {
-                rebind_lazy_symbol(header, slide, rebinds, 1);
-                NSLog(@"[Stealth] ✅ 懒加载表 Hook 已执行");
+                // 这一次，我们扫描的范围更大了，但依然限制在安全的 __DATA 段
+                rebind_data_symbols(header, slide, rebinds, 1);
+                NSLog(@"[Stealth] ✅ 全能表(Lazy+NonLazy) Hook 已执行");
             }
         });
     });
