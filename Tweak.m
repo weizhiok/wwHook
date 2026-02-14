@@ -4,30 +4,43 @@
 #import <objc/runtime.h>
 
 // =======================================================
-// ⚙️ 目标 BundleID
+// ⚙️ 配置：你的目标假 ID
 // =======================================================
 static NSString * const kTargetBundleID = @"com.user.bundlechecker";
 // =======================================================
 
 // ----------------------------------------------------------------
-// 🛡️ 准备好要 Hook 的方法，但先不执行
+// 🛡️ 1. 定义要欺骗的方法 (OC Category)
 // ----------------------------------------------------------------
 @implementation NSBundle (Stealth)
 
+// 伪造 bundleIdentifier
 - (NSString *)stealth_bundleIdentifier {
     return kTargetBundleID;
 }
 
+// 伪造 infoDictionary (这是很多检测工具的后门)
 - (NSDictionary *)stealth_infoDictionary {
+    // 1. 获取原始字典
     NSDictionary *originalDict = [self stealth_infoDictionary];
+    
+    // 2. 如果字典存在，不仅要防崩溃，还要修改它
     if (originalDict && [originalDict isKindOfClass:[NSDictionary class]]) {
+        // 深拷贝一份，防止修改原始数据导致系统异常
         NSMutableDictionary *newDict = [originalDict mutableCopy];
+        
+        // 修改核心 ID
         newDict[@"CFBundleIdentifier"] = kTargetBundleID;
+        
+        // 顺手把版本号也保护一下（可选）
+        // newDict[@"CFBundleShortVersionString"] = @"1.0.0";
+        
         return newDict;
     }
     return originalDict;
 }
 
+// 伪造 objectForInfoDictionaryKey
 - (id)stealth_objectForInfoDictionaryKey:(NSString *)key {
     if ([key isEqualToString:@"CFBundleIdentifier"]) {
         return kTargetBundleID;
@@ -38,70 +51,41 @@ static NSString * const kTargetBundleID = @"com.user.bundlechecker";
 @end
 
 // ----------------------------------------------------------------
-// 🚀 核心入口：先活着，再动手
+// ⚡️ 2. 核弹级入口：构造函数 (Constructor)
 // ----------------------------------------------------------------
-__attribute__((constructor)) static void ModuleEntry() {
+// 这个函数会在 App 的 main() 函数之前执行
+// 优先级：插件 > App 主程序
+__attribute__((constructor)) static void EntryPoint() {
     
-    // 1. 震动：证明注入成功
+    // ---------------------------------------------------
+    // 第一步：震动 (Physically Verify)
+    // ---------------------------------------------------
+    // 只要手机一震，说明你的插件已经接管了进程
     AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-    NSLog(@"[DelayHook] ⚡️ 震动触发，插件已加载，当前保持纯净状态...");
+    NSLog(@"[FinalHook] ⚡️ 插件已加载，正在执行拦截...");
 
-    // ⚠️ 此时不要 Hook！防止系统启动检查杀进程！
-
-    // 2. 延迟 6 秒：等 App 完全启动进入首页，避开风头
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        
-        NSLog(@"[DelayHook] ⏳ 安全时间已到，准备动手...");
-        
-        // ---------------------------------------------------
-        // 第一阶段：先弹窗 (证明我们活过了启动期)
-        // ---------------------------------------------------
-        UIWindow *topWindow = nil;
-        if (@available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if (scene.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *w in scene.windows) {
-                        if (w.isKeyWindow) { topWindow = w; break; }
-                    }
-                }
-            }
-        }
-        if (!topWindow) topWindow = [UIApplication sharedApplication].windows.firstObject;
-
-        if (topWindow) {
-            UIViewController *rootVC = topWindow.rootViewController;
-            while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
-
-            NSString *msg = [NSString stringWithFormat:@"✅ 存活确认！\n\n点击[开始伪装]后，将执行 Hook。\n\n目标 ID:\n%@", kTargetBundleID];
-            
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"🕵️‍♂️ 延迟注入系统"
-                                                                           message:msg
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-            
-            // ---------------------------------------------------
-            // 第二阶段：用户点击后才 Hook (最安全)
-            // ---------------------------------------------------
-            [alert addAction:[UIAlertAction actionWithTitle:@"开始伪装" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-                
-                // 🔥 动手！执行 Swizzling
-                Method orig = class_getInstanceMethod([NSBundle class], @selector(bundleIdentifier));
-                Method hook = class_getInstanceMethod([NSBundle class], @selector(stealth_bundleIdentifier));
-                if (orig && hook) method_exchangeImplementations(orig, hook);
-                
-                Method origInfo = class_getInstanceMethod([NSBundle class], @selector(infoDictionary));
-                Method hookInfo = class_getInstanceMethod([NSBundle class], @selector(stealth_infoDictionary));
-                if (origInfo && hookInfo) method_exchangeImplementations(origInfo, hookInfo);
-                
-                Method origKey = class_getInstanceMethod([NSBundle class], @selector(objectForInfoDictionaryKey:));
-                Method hookKey = class_getInstanceMethod([NSBundle class], @selector(stealth_objectForInfoDictionaryKey:));
-                if (origKey && hookKey) method_exchangeImplementations(origKey, hookKey);
-                
-                // 再震动一下提示成功
-                AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-                NSLog(@"[DelayHook] ✅ Hook 已执行！");
-            }]];
-            
-            [rootVC presentViewController:alert animated:YES completion:nil];
-        }
-    });
+    // ---------------------------------------------------
+    // 第二步：立即 Hook (Zero Latency)
+    // ---------------------------------------------------
+    // 不用 dispatch_after，不用 wait，直接动手！
+    // 因为这是纯 OC 运行时交换，不涉及 UI，iOS 18 是允许的。
+    
+    Class cls = [NSBundle class];
+    
+    // 1. Hook bundleIdentifier
+    Method m1 = class_getInstanceMethod(cls, @selector(bundleIdentifier));
+    Method m2 = class_getInstanceMethod(cls, @selector(stealth_bundleIdentifier));
+    if (m1 && m2) method_exchangeImplementations(m1, m2);
+    
+    // 2. Hook infoDictionary
+    Method m3 = class_getInstanceMethod(cls, @selector(infoDictionary));
+    Method m4 = class_getInstanceMethod(cls, @selector(stealth_infoDictionary));
+    if (m3 && m4) method_exchangeImplementations(m3, m4);
+    
+    // 3. Hook objectForInfoDictionaryKey
+    Method m5 = class_getInstanceMethod(cls, @selector(objectForInfoDictionaryKey:));
+    Method m6 = class_getInstanceMethod(cls, @selector(stealth_objectForInfoDictionaryKey:));
+    if (m5 && m6) method_exchangeImplementations(m5, m6);
+    
+    NSLog(@"[FinalHook] ✅ 拦截网已部署完毕 (Main函数启动前)");
 }
