@@ -14,7 +14,7 @@ static NSString * const kTargetBundleID = @"com.user.bundlechecker";
 // =======================================================
 
 // ----------------------------------------------------------------
-// 🐟 1. Fishhook 核心代码 (精简版)
+// 🐟 Fishhook 核心 (只保留处理逻辑，不含自动注册)
 // ----------------------------------------------------------------
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -93,8 +93,9 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
     }
 }
 
-static void rebind_symbols_image(const struct mach_header *header,
-                                 intptr_t slide) {
+// 🟢 核心函数：只处理单个 Image
+static void rebind_symbols_for_image(const struct mach_header *header,
+                                     intptr_t slide) {
     Dl_info info;
     if (dladdr(header, &info) == 0) return;
     
@@ -126,7 +127,7 @@ static void rebind_symbols_image(const struct mach_header *header,
     cur_seg_cmd = (segment_command_t *)((uintptr_t)header + sizeof(mach_header_t));
     for (uint i = 0; i < header->ncmds; i++, cur_seg_cmd = (segment_command_t *)((uintptr_t)cur_seg_cmd + cur_seg_cmd->cmdsize)) {
         if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            // 扫描 __DATA 和 __DATA_CONST (最安全的区域)
+            // 扫描 __DATA 和 __DATA_CONST
             if (strcmp(cur_seg_cmd->segname, "__DATA") == 0 ||
                 strcmp(cur_seg_cmd->segname, "__DATA_CONST") == 0) {
                 
@@ -142,78 +143,69 @@ static void rebind_symbols_image(const struct mach_header *header,
     }
 }
 
-static int rebind_symbols(struct rebind_entry *rebindings, size_t rebindings_nel) {
-    int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);
-    if (retval < 0) return retval;
-    if (!_rebindings_head->next) {
-        _dyld_register_func_for_add_image(rebind_symbols_image);
-    } else {
-        uint32_t c = _dyld_image_count();
-        for (uint32_t i = 0; i < c; i++) {
-            rebind_symbols_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
-        }
-    }
-    return retval;
-}
-
 // ----------------------------------------------------------------
-// 🛡️ 2. C Hook 实现逻辑
+// 🛡️ Hooks
 // ----------------------------------------------------------------
-
-// 保存原始函数指针
 static CFStringRef (*orig_CFBundleGetIdentifier)(CFBundleRef bundle);
 
-// 新函数：拦截 CFBundleGetIdentifier
 CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
-    // 如果是查主包的 ID，直接给假的
+    // 简单粗暴拦截
     if (bundle == CFBundleGetMainBundle()) {
         return (__bridge CFStringRef)kTargetBundleID;
     }
-    // 否则调用原函数
-    if (orig_CFBundleGetIdentifier) {
-        return orig_CFBundleGetIdentifier(bundle);
-    }
+    if (orig_CFBundleGetIdentifier) return orig_CFBundleGetIdentifier(bundle);
     return NULL;
 }
 
 @implementation NSBundle (Stealth)
 
 // ----------------------------------------------------------------
-// ⚡️ 3. 核心入口：+load (最稳的启动点)
+// ⚡️ 核心入口
 // ----------------------------------------------------------------
 + (void)load {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         
-        // 1. 震动反馈 (确认注入)
+        // 1. 震动
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-            NSLog(@"[Stealth] ⚡️ 震动触发 - 注入成功");
         });
 
-        // 2. 核心：切到主线程后再执行拦截 (防止启动崩溃)
+        // 2. 主线程拦截
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSLog(@"[Stealth] 🚀 主线程启动，开始部署拦截...");
+            NSLog(@"[Stealth] 🚀 主线程启动...");
             
-            // A. 执行 OC Swizzling (保持上一版的成功经验)
+            // A. OC Swizzle (保持不变)
             [self swizzleInstanceMethod:@selector(bundleIdentifier) with:@selector(hook_bundleIdentifier)];
             [self swizzleInstanceMethod:@selector(infoDictionary) with:@selector(hook_infoDictionary)];
             [self swizzleInstanceMethod:@selector(objectForInfoDictionaryKey:) with:@selector(hook_objectForInfoDictionaryKey:)];
             
-            // B. 执行 Fishhook (新增！！拦截 C 函数)
+            // B. 外科手术式 C Hook (只针对主程序!)
             struct rebind_entry rebinds[] = {
                 {"CFBundleGetIdentifier", (void *)new_CFBundleGetIdentifier, (void **)&orig_CFBundleGetIdentifier},
             };
-            // ⚠️ 关键：我们在主线程才开始 Rebind，避开 dyld 的启动死区
-            rebind_symbols(rebinds, 1);
             
-            NSLog(@"[Stealth] ✅ 全面拦截 (OC + C) 部署完成");
+            // ⚠️ 关键修改：不要调用 rebind_symbols (它会遍历所有库)
+            // 我们手动把 rebinds 放到链表中
+            prepend_rebindings(&_rebindings_head, rebinds, 1);
+            
+            // ⚠️ 关键修改：只获取 Index 0 的 Image (也就是 App 主程序)
+            const struct mach_header *mainHeader = _dyld_get_image_header(0);
+            intptr_t mainSlide = _dyld_get_image_vmaddr_slide(0);
+            
+            if (mainHeader) {
+                // 只修改主程序的符号表，绝对安全！
+                rebind_symbols_for_image(mainHeader, mainSlide);
+                NSLog(@"[Stealth] ✅ 仅对主程序(Index 0)执行了 C Hook");
+            } else {
+                NSLog(@"[Stealth] ❌ 无法获取主程序 Header");
+            }
         });
     });
 }
 
 // ----------------------------------------------------------------
-// 🛠 辅助工具 & OC Hooks
+// 🛠 OC Hooks (保持不变)
 // ----------------------------------------------------------------
 + (void)swizzleInstanceMethod:(SEL)originalSel with:(SEL)newSel {
     Class class = [self class];
@@ -226,9 +218,7 @@ CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
     }
 }
 
-- (NSString *)hook_bundleIdentifier {
-    return kTargetBundleID;
-}
+- (NSString *)hook_bundleIdentifier { return kTargetBundleID; }
 
 - (NSDictionary *)hook_infoDictionary {
     NSDictionary *originalDict = [self hook_infoDictionary];
@@ -241,9 +231,7 @@ CFStringRef new_CFBundleGetIdentifier(CFBundleRef bundle) {
 }
 
 - (id)hook_objectForInfoDictionaryKey:(NSString *)key {
-    if ([key isEqualToString:@"CFBundleIdentifier"]) {
-        return kTargetBundleID;
-    }
+    if ([key isEqualToString:@"CFBundleIdentifier"]) return kTargetBundleID;
     return [self hook_objectForInfoDictionaryKey:key];
 }
 
