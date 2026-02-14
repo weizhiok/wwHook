@@ -1,10 +1,11 @@
-TARGET := iphone:clang:latest:14.0
+TARGET := iphone:clang:latest:15.0
+ARCHS = arm64
+
 include $(THEOS)/makefiles/common.mk
 
-LIBRARY_NAME = FakeBundleID
-FakeBundleID_FILES = Tweak.m
-FakeBundleID_CFLAGS = -fobjc-arc
-FakeBundleID_FRAMEWORKS = Foundation
+LIBRARY_NAME = StealthBundleID
+StealthBundleID_FILES = Tweak.m
+StealthBundleID_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+StealthBundleID_FRAMEWORKS = Foundation Security
 
-# 必须是 library.mk，不能是 tweak.mk
 include $(THEOS_MAKE_PATH)/library.mk
