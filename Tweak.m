@@ -1,91 +1,101 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <AudioToolbox/AudioToolbox.h> // 震动支持
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 
 // =======================================================
-// ⚙️ 配置：你的目标假 ID
+// ⚙️ 配置：目标假 ID
 // =======================================================
 static NSString * const kTargetBundleID = @"com.user.bundlechecker";
 // =======================================================
 
-// ----------------------------------------------------------------
-// 🛡️ 1. 定义要欺骗的方法 (OC Category)
-// ----------------------------------------------------------------
-@implementation NSBundle (Stealth)
+// 我们定义一个伪装类，只为了利用它的 +load 方法
+@interface StealthLoader : NSObject
+@end
 
-// 伪造 bundleIdentifier
+@implementation StealthLoader
+
+// ⚡️ 核心入口：+load 方法
+// 这个方法会在类加载时自动运行，早于 main 函数，且 ObjC 环境已准备就绪
++ (void)load {
+    // ---------------------------------------------------
+    // 1. 震动反馈 (放入异步线程，防止阻塞主线程导致闪退)
+    // ---------------------------------------------------
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+        NSLog(@"[Stealth] ⚡️ 插件已加载 (Vibration Triggered)");
+    });
+
+    // ---------------------------------------------------
+    // 2. 立即执行 Hook (同步执行，确保覆盖检测)
+    // ---------------------------------------------------
+    NSLog(@"[Stealth] 🛠 开始执行 Method Swizzling...");
+    
+    // 执行交换逻辑
+    [self swizzleNSBundle];
+    
+    NSLog(@"[Stealth] ✅ Method Swizzling 完成");
+}
+
++ (void)swizzleNSBundle {
+    Class cls = [NSBundle class];
+    
+    // 定义我们要交换的方法对
+    // 格式：{ 原方法 SEL, 新方法 SEL }
+    struct { SEL original; SEL swizzled; } methods[] = {
+        { @selector(bundleIdentifier), @selector(stealth_bundleIdentifier) },
+        { @selector(infoDictionary), @selector(stealth_infoDictionary) },
+        { @selector(objectForInfoDictionaryKey:), @selector(stealth_objectForInfoDictionaryKey:) }
+    };
+    
+    int count = sizeof(methods) / sizeof(methods[0]);
+    
+    for (int i = 0; i < count; i++) {
+        SEL origSEL = methods[i].original;
+        SEL swizSEL = methods[i].swizzled;
+        
+        Method origMethod = class_getInstanceMethod(cls, origSEL);
+        Method swizMethod = class_getInstanceMethod(self, swizSEL); // 注意：新方法实现在当前类(StealthLoader)里
+        
+        // 这里的逻辑是：把 NSBundle 的原方法，指向我们 StealthLoader 类里的新实现
+        // 这种跨类 Swizzle 更安全，不容易导致无限递归
+        if (origMethod && swizMethod) {
+            method_exchangeImplementations(origMethod, swizMethod);
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// 🛡️ 新的方法实现 (注意：这些方法会被添加到 NSBundle 上去)
+// ----------------------------------------------------------------
+
 - (NSString *)stealth_bundleIdentifier {
     return kTargetBundleID;
 }
 
-// 伪造 infoDictionary (这是很多检测工具的后门)
 - (NSDictionary *)stealth_infoDictionary {
-    // 1. 获取原始字典
-    NSDictionary *originalDict = [self stealth_infoDictionary];
+    // 因为跨类交换了，这里调用 [self stealth_infoDictionary] 实际上会回到 NSBundle 的原逻辑
+    // 为了防止编译器警告，我们需要强制转换一下，或者使用 runtime 调用
+    // 简单起见，我们假设如果能拿到原始字典就改，拿不到就返回 nil
     
-    // 2. 如果字典存在，不仅要防崩溃，还要修改它
-    if (originalDict && [originalDict isKindOfClass:[NSDictionary class]]) {
-        // 深拷贝一份，防止修改原始数据导致系统异常
-        NSMutableDictionary *newDict = [originalDict mutableCopy];
-        
-        // 修改核心 ID
-        newDict[@"CFBundleIdentifier"] = kTargetBundleID;
-        
-        // 顺手把版本号也保护一下（可选）
-        // newDict[@"CFBundleShortVersionString"] = @"1.0.0";
-        
-        return newDict;
-    }
-    return originalDict;
+    // 注意：这里是一个比较 tricky 的地方。为了防闪退，我们不调用原方法了，直接构建假数据。
+    // 调用原方法在跨类交换时容易出问题。
+    
+    NSMutableDictionary *fakeDict = [NSMutableDictionary dictionary];
+    fakeDict[@"CFBundleIdentifier"] = kTargetBundleID;
+    fakeDict[@"CFBundleShortVersionString"] = @"1.0.0";
+    fakeDict[@"CFBundleVersion"] = @"1";
+    // 如果你需要更多字段，可以在这里手动补上
+    
+    return fakeDict;
 }
 
-// 伪造 objectForInfoDictionaryKey
 - (id)stealth_objectForInfoDictionaryKey:(NSString *)key {
     if ([key isEqualToString:@"CFBundleIdentifier"]) {
         return kTargetBundleID;
     }
-    return [self stealth_objectForInfoDictionaryKey:key];
+    // 如果不是查 ID，返回 nil 或者默认值 (为了防闪退，我们尽量少操作原对象)
+    return nil; 
 }
 
 @end
-
-// ----------------------------------------------------------------
-// ⚡️ 2. 核弹级入口：构造函数 (Constructor)
-// ----------------------------------------------------------------
-// 这个函数会在 App 的 main() 函数之前执行
-// 优先级：插件 > App 主程序
-__attribute__((constructor)) static void EntryPoint() {
-    
-    // ---------------------------------------------------
-    // 第一步：震动 (Physically Verify)
-    // ---------------------------------------------------
-    // 只要手机一震，说明你的插件已经接管了进程
-    AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-    NSLog(@"[FinalHook] ⚡️ 插件已加载，正在执行拦截...");
-
-    // ---------------------------------------------------
-    // 第二步：立即 Hook (Zero Latency)
-    // ---------------------------------------------------
-    // 不用 dispatch_after，不用 wait，直接动手！
-    // 因为这是纯 OC 运行时交换，不涉及 UI，iOS 18 是允许的。
-    
-    Class cls = [NSBundle class];
-    
-    // 1. Hook bundleIdentifier
-    Method m1 = class_getInstanceMethod(cls, @selector(bundleIdentifier));
-    Method m2 = class_getInstanceMethod(cls, @selector(stealth_bundleIdentifier));
-    if (m1 && m2) method_exchangeImplementations(m1, m2);
-    
-    // 2. Hook infoDictionary
-    Method m3 = class_getInstanceMethod(cls, @selector(infoDictionary));
-    Method m4 = class_getInstanceMethod(cls, @selector(stealth_infoDictionary));
-    if (m3 && m4) method_exchangeImplementations(m3, m4);
-    
-    // 3. Hook objectForInfoDictionaryKey
-    Method m5 = class_getInstanceMethod(cls, @selector(objectForInfoDictionaryKey:));
-    Method m6 = class_getInstanceMethod(cls, @selector(stealth_objectForInfoDictionaryKey:));
-    if (m5 && m6) method_exchangeImplementations(m5, m6);
-    
-    NSLog(@"[FinalHook] ✅ 拦截网已部署完毕 (Main函数启动前)");
-}
